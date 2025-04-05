@@ -641,7 +641,7 @@ def get_date_range(period):
     
     return start_date, end_date
 
-# Функции для создания Excel файлов
+# Continuation of the Excel file creation function
 def create_excel_file(data_type, data, filename):
     workbook = openpyxl.Workbook()
     sheet = workbook.active
@@ -750,3 +750,582 @@ def create_excel_file(data_type, data, filename):
     for sheet in workbook.worksheets:
         for col in sheet.columns:
             max_length = 0
+            column = col[0].column_letter
+            for cell in col:
+                try:
+                    if len(str(cell.value)) > max_length:
+                        max_length = min(len(str(cell.value)), 100)  # Ограничение ширины столбца
+                except:
+                    pass
+            adjusted_width = (max_length + 2)
+            sheet.column_dimensions[column].width = adjusted_width
+    
+    # Сохранение файла
+    workbook.save(filename)
+    return filename
+
+# Обработчик для экспорта данных - запрос периода
+@dp.message(lambda message: message.text in ["Экспорт постов", "Экспорт комментариев", "Экспорт сообщений", "Экспорт всего контента"])
+async def export_request(message: types.Message, state: FSMContext):
+    # Сохраняем выбранный тип данных в состоянии
+    data_type_mapping = {
+        "Экспорт постов": "posts",
+        "Экспорт комментариев": "comments",
+        "Экспорт сообщений": "messages",
+        "Экспорт всего контента": "all"
+    }
+    data_type = data_type_mapping.get(message.text)
+    await state.update_data(data_type=data_type)
+    
+    # Создаем клавиатуру с выбором периода
+    keyboard = InlineKeyboardMarkup(
+        inline_keyboard=[
+            [
+                InlineKeyboardButton(text="Неделя", callback_data="period_week"),
+                InlineKeyboardButton(text="2 недели", callback_data="period_two_weeks")
+            ],
+            [
+                InlineKeyboardButton(text="Месяц", callback_data="period_month"),
+                InlineKeyboardButton(text="3 месяца", callback_data="period_three_months")
+            ],
+            [
+                InlineKeyboardButton(text="Указать даты", callback_data="custom_period")
+            ]
+        ]
+    )
+    
+    await message.answer("Выберите период для экспорта:", reply_markup=keyboard)
+
+# Обработчик выбора периода
+@dp.callback_query(lambda c: c.data.startswith('period_'))
+async def process_period_selection(callback_query: types.CallbackQuery, state: FSMContext):
+    period = callback_query.data.split('_')[1]
+    state_data = await state.get_data()
+    data_type = state_data.get('data_type')
+    
+    start_date, end_date = get_date_range(period)
+    
+    # Получение данных
+    data = get_data_by_period(data_type, start_date, end_date)
+    
+    # Создание имени файла
+    file_suffix = datetime.now().strftime('%Y%m%d_%H%M%S')
+    file_name = f"{TEMP_DIR}/{data_type}_{file_suffix}.xlsx"
+    
+    # Создание Excel файла
+    try:
+        file_path = create_excel_file(data_type, data, file_name)
+        
+        # Отправка файла
+        excel_file = FSInputFile(file_path)
+        await bot.send_document(
+            callback_query.from_user.id,
+            document=excel_file,
+            caption=f"Экспорт данных ({data_type}) за период {start_date} - {end_date}"
+        )
+        
+        # Удаление временного файла
+        try:
+            os.remove(file_path)
+        except:
+            pass
+        
+        await callback_query.answer("Файл успешно экспортирован!")
+    except Exception as e:
+        logger.error(f"Ошибка при создании файла экспорта: {e}")
+        await bot.send_message(
+            callback_query.from_user.id,
+            f"Произошла ошибка при экспорте данных: {str(e)}"
+        )
+        await callback_query.answer("Ошибка при экспорте!")
+
+# Обработчик выбора произвольного периода
+@dp.callback_query(lambda c: c.data == 'custom_period')
+async def process_custom_period(callback_query: types.CallbackQuery, state: FSMContext):
+    await bot.send_message(
+        callback_query.from_user.id,
+        "Введите начальную дату в формате ГГГГ-ММ-ДД:"
+    )
+    await state.set_state(FormStates.waiting_for_start_date)
+    await callback_query.answer()
+
+# Обработчик ввода начальной даты
+@dp.message(FormStates.waiting_for_start_date)
+async def process_start_date(message: types.Message, state: FSMContext):
+    try:
+        # Проверка формата даты
+        datetime.strptime(message.text, '%Y-%m-%d')
+        
+        # Сохранение даты
+        await state.update_data(start_date=f"{message.text} 00:00:00")
+        
+        await message.answer("Введите конечную дату в формате ГГГГ-ММ-ДД:")
+        await state.set_state(FormStates.waiting_for_end_date)
+    except ValueError:
+        await message.answer("Неверный формат даты. Пожалуйста, введите дату в формате ГГГГ-ММ-ДД (например, 2023-12-31):")
+
+# Обработчик ввода конечной даты
+@dp.message(FormStates.waiting_for_end_date)
+async def process_end_date(message: types.Message, state: FSMContext):
+    try:
+        # Проверка формата даты
+        datetime.strptime(message.text, '%Y-%m-%d')
+        
+        # Сохранение даты
+        await state.update_data(end_date=f"{message.text} 23:59:59")
+        
+        # Получение всех данных из состояния
+        state_data = await state.get_data()
+        data_type = state_data.get('data_type')
+        start_date = state_data.get('start_date')
+        end_date = state_data.get('end_date')
+        
+        # Получение данных
+        data = get_data_by_period(data_type, start_date, end_date)
+        
+        # Создание имени файла
+        file_suffix = datetime.now().strftime('%Y%m%d_%H%M%S')
+        file_name = f"{TEMP_DIR}/{data_type}_{file_suffix}.xlsx"
+        
+        # Создание Excel файла
+        try:
+            file_path = create_excel_file(data_type, data, file_name)
+            
+            # Отправка файла
+            excel_file = FSInputFile(file_path)
+            await message.answer_document(
+                document=excel_file,
+                caption=f"Экспорт данных ({data_type}) за период {start_date} - {end_date}"
+            )
+            
+            # Удаление временного файла
+            try:
+                os.remove(file_path)
+            except:
+                pass
+            
+            # Сброс состояния
+            await state.clear()
+        except Exception as e:
+            logger.error(f"Ошибка при создании файла экспорта: {e}")
+            await message.answer(f"Произошла ошибка при экспорте данных: {str(e)}")
+    except ValueError:
+        await message.answer("Неверный формат даты. Пожалуйста, введите дату в формате ГГГГ-ММ-ДД (например, 2023-12-31):")
+
+# Обработчик для просмотра статистики
+@dp.message(lambda message: message.text == "Статистика")
+async def show_statistics(message: types.Message):
+    try:
+        # Получение статистики
+        stats = get_statistics()
+        
+        # Создание графиков
+        charts = create_statistics_charts(stats)
+        
+        # Формирование текста статистики
+        stats_text = "📊 **Статистика сбора данных:**\n\n"
+        stats_text += f"📝 Всего постов: {stats['total_posts']}\n"
+        stats_text += f"💬 Всего комментариев: {stats['total_comments']}\n"
+        stats_text += f"📱 Всего сообщений: {stats['total_messages']}\n\n"
+        
+        stats_text += "📈 **Топ каналов:**\n"
+        for i, (channel, count) in enumerate(stats['top_channels'], 1):
+            stats_text += f"{i}. {channel}: {count} постов\n"
+        
+        stats_text += "\n🗣 **Настроение комментариев:**\n"
+        for sentiment, count in stats['sentiment_stats']:
+            stats_text += f"{sentiment}: {count}\n"
+        
+        # Отправка текстовой статистики
+        await message.answer(stats_text)
+        
+        # Отправка графиков
+        await message.answer_photo(FSInputFile(charts["activity_chart"]), caption="Активность по дням недели")
+        await message.answer_photo(FSInputFile(charts["sentiment_chart"]), caption="Распределение настроения комментариев")
+        
+        if charts.get("media_chart"):
+            await message.answer_photo(FSInputFile(charts["media_chart"]), caption="Типы медиа контента")
+        
+        # Удаление временных файлов
+        for chart_path in charts.values():
+            if chart_path:
+                try:
+                    os.remove(chart_path)
+                except:
+                    pass
+    except Exception as e:
+        logger.error(f"Ошибка при показе статистики: {e}")
+        await message.answer(f"Произошла ошибка при получении статистики: {str(e)}")
+
+# Обработчик для поиска контента - запрос поискового запроса
+@dp.message(lambda message: message.text == "Поиск контента")
+async def search_request(message: types.Message, state: FSMContext):
+    await message.answer("Введите поисковый запрос:")
+    await state.set_state(FormStates.waiting_for_search_query)
+
+# Обработчик ввода поискового запроса
+@dp.message(FormStates.waiting_for_search_query)
+async def process_search_query(message: types.Message, state: FSMContext):
+    query = message.text
+    await state.update_data(search_query=query)
+    
+    # Создаем клавиатуру с выбором периода
+    keyboard = InlineKeyboardMarkup(
+        inline_keyboard=[
+            [
+                InlineKeyboardButton(text="Неделя", callback_data="search_week"),
+                InlineKeyboardButton(text="2 недели", callback_data="search_two_weeks")
+            ],
+            [
+                InlineKeyboardButton(text="Месяц", callback_data="search_month"),
+                InlineKeyboardButton(text="3 месяца", callback_data="search_three_months")
+            ],
+            [
+                InlineKeyboardButton(text="Все время", callback_data="search_all")
+            ]
+        ]
+    )
+    
+    await message.answer("Выберите период для поиска:", reply_markup=keyboard)
+
+# Обработчик выбора периода для поиска
+@dp.callback_query(lambda c: c.data.startswith('search_'))
+async def process_search_period(callback_query: types.CallbackQuery, state: FSMContext):
+    period = callback_query.data.split('_')[1]
+    state_data = await state.get_data()
+    query = state_data.get('search_query')
+    
+    if period == "all":
+        # Поиск без ограничения по дате
+        results = search_content(query)
+    else:
+        start_date, end_date = get_date_range(period)
+        results = search_content(query, start_date, end_date)
+    
+    if results:
+        # Формирование сообщения с результатами
+        result_text = f"🔍 Результаты поиска по запросу '{query}':\n\n"
+        
+        # Ограничение количества результатов для показа
+        show_limit = min(20, len(results))
+        for i, result in enumerate(results[:show_limit], 1):
+            result_type = result.get('type', 'unknown')
+            content = result.get('content', '')[:100] + '...' if len(result.get('content', '')) > 100 else result.get('content', '')
+            source = result.get('channel_name', '')
+            date = result.get('date', '')
+            
+            if result_type == 'post':
+                emoji = "📝"
+            elif result_type == 'comment':
+                emoji = "💬"
+            elif result_type == 'message':
+                emoji = "📱"
+            else:
+                emoji = "📄"
+            
+            result_text += f"{i}. {emoji} **{result_type.capitalize()}** от {date}\n"
+            result_text += f"Источник: {source}\n"
+            result_text += f"Текст: {content}\n\n"
+        
+        if len(results) > show_limit:
+            result_text += f"\n... и еще {len(results) - show_limit} результатов."
+            
+            # Предложение экспорта результатов
+            keyboard = InlineKeyboardMarkup(
+                inline_keyboard=[
+                    [
+                        InlineKeyboardButton(text="Экспортировать все результаты", callback_data=f"export_search_{query}")
+                    ]
+                ]
+            )
+            await bot.send_message(
+                callback_query.from_user.id,
+                result_text,
+                reply_markup=keyboard
+            )
+        else:
+            await bot.send_message(
+                callback_query.from_user.id,
+                result_text
+            )
+    else:
+        await bot.send_message(
+            callback_query.from_user.id,
+            f"По запросу '{query}' ничего не найдено."
+        )
+    
+    # Сброс состояния
+    await state.clear()
+    await callback_query.answer()
+
+# Обработчик запроса на экспорт результатов поиска
+@dp.callback_query(lambda c: c.data.startswith('export_search_'))
+async def export_search_results(callback_query: types.CallbackQuery):
+    query = callback_query.data.replace('export_search_', '')
+    
+    # Получение всех результатов
+    results = search_content(query)
+    
+    if results:
+        # Подготовка данных для экспорта
+        posts_data = [r for r in results if r.get('type') == 'post']
+        comments_data = [r for r in results if r.get('type') == 'comment']
+        messages_data = [r for r in results if r.get('type') == 'message']
+        
+        # Структурирование данных для функции экспорта
+        export_data = {}
+        if posts_data:
+            export_data['posts'] = posts_data
+        if comments_data:
+            export_data['comments'] = comments_data
+        if messages_data:
+            export_data['messages'] = messages_data
+        
+        # Создание имени файла
+        file_suffix = datetime.now().strftime('%Y%m%d_%H%M%S')
+        file_name = f"{TEMP_DIR}/search_{file_suffix}.xlsx"
+        
+        # Создание Excel файла
+        try:
+            file_path = create_excel_file("all", export_data, file_name)
+            
+            # Отправка файла
+            excel_file = FSInputFile(file_path)
+            await bot.send_document(
+                callback_query.from_user.id,
+                document=excel_file,
+                caption=f"Результаты поиска по запросу '{query}'"
+            )
+            
+            # Удаление временного файла
+            try:
+                os.remove(file_path)
+            except:
+                pass
+            
+            await callback_query.answer("Файл успешно экспортирован!")
+        except Exception as e:
+            logger.error(f"Ошибка при создании файла экспорта: {e}")
+            await bot.send_message(
+                callback_query.from_user.id,
+                f"Произошла ошибка при экспорте результатов поиска: {str(e)}"
+            )
+            await callback_query.answer("Ошибка при экспорте!")
+    else:
+        await bot.send_message(
+            callback_query.from_user.id,
+            f"По запросу '{query}' ничего не найдено."
+        )
+        await callback_query.answer()
+
+# Обработчик для управления источниками
+@dp.message(lambda message: message.text == "Управление источниками")
+async def manage_sources(message: types.Message):
+    # Создаем клавиатуру с действиями
+    keyboard = InlineKeyboardMarkup(
+        inline_keyboard=[
+            [
+                InlineKeyboardButton(text="Добавить источник", callback_data="add_source")
+            ],
+            [
+                InlineKeyboardButton(text="Список источников", callback_data="list_sources")
+            ]
+        ]
+    )
+    
+    await message.answer("Выберите действие для управления источниками:", reply_markup=keyboard)
+
+# Обработчик запроса на добавление источника
+@dp.callback_query(lambda c: c.data == 'add_source')
+async def add_source_request(callback_query: types.CallbackQuery, state: FSMContext):
+    await bot.send_message(
+        callback_query.from_user.id,
+        "Введите название канала или группы (без @):"
+    )
+    await state.set_state(FormStates.waiting_for_channel_name)
+    await callback_query.answer()
+
+# Обработчик ввода имени канала
+@dp.message(FormStates.waiting_for_channel_name)
+async def process_channel_name(message: types.Message, state: FSMContext):
+    channel_name = message.text.strip()
+    
+    try:
+        # Попытка получить информацию о канале/группе
+        entity = await client.get_entity(channel_name)
+        
+        # Определение типа источника
+        if hasattr(entity, 'megagroup') and entity.megagroup:
+            source_type = "group"
+        elif hasattr(entity, 'broadcast') and entity.broadcast:
+            source_type = "channel"
+        else:
+            source_type = "chat"
+        
+        # Добавление источника в базу данных
+        success = add_monitored_source(entity.id, entity.title, source_type)
+        
+        if success:
+            await message.answer(f"Источник '{entity.title}' успешно добавлен для мониторинга!")
+        else:
+            await message.answer(f"Источник '{entity.title}' уже отслеживается.")
+        
+        # Сброс состояния
+        await state.clear()
+    except Exception as e:
+        logger.error(f"Ошибка при добавлении источника: {e}")
+        await message.answer(f"Не удалось найти или добавить источник. Убедитесь, что имя введено правильно и бот имеет доступ к этому каналу/группе.")
+
+# Обработчик запроса списка источников
+@dp.callback_query(lambda c: c.data == 'list_sources')
+async def list_sources(callback_query: types.CallbackQuery):
+    sources = get_monitored_sources()
+    
+    if sources:
+        source_text = "📋 **Список отслеживаемых источников:**\n\n"
+        
+        for i, (source_id, source_name, source_type) in enumerate(sources, 1):
+            if source_type == "channel":
+                emoji = "📢"
+            elif source_type == "group":
+                emoji = "👥"
+            else:
+                emoji = "💬"
+            
+            source_text += f"{i}. {emoji} **{source_name}** (ID: {source_id}, Тип: {source_type})\n"
+        
+        await bot.send_message(
+            callback_query.from_user.id,
+            source_text
+        )
+    else:
+        await bot.send_message(
+            callback_query.from_user.id,
+            "Нет отслеживаемых источников."
+        )
+    
+    await callback_query.answer()
+
+# Обработчик для управления ключевыми словами
+@dp.message(lambda message: message.text == "Ключевые слова")
+async def manage_keywords(message: types.Message):
+    # Создаем клавиатуру с действиями
+    keyboard = InlineKeyboardMarkup(
+        inline_keyboard=[
+            [
+                InlineKeyboardButton(text="Добавить ключевое слово", callback_data="add_keyword")
+            ],
+            [
+                InlineKeyboardButton(text="Список ключевых слов", callback_data="list_keywords")
+            ]
+        ]
+    )
+    
+    await message.answer("Выберите действие для управления ключевыми словами:", reply_markup=keyboard)
+
+# Обработчик запроса на добавление ключевого слова
+@dp.callback_query(lambda c: c.data == 'add_keyword')
+async def add_keyword_request(callback_query: types.CallbackQuery):
+    await bot.send_message(
+        callback_query.from_user.id,
+        "Введите ключевое слово для отслеживания:"
+    )
+    
+    # Создание обработчика для следующего сообщения от этого пользователя
+    @dp.message(lambda message: message.from_user.id == callback_query.from_user.id)
+    async def process_keyword(message: types.Message):
+        keyword = message.text.strip()
+        
+        if keyword:
+            success = add_keyword(keyword)
+            
+            if success:
+                await message.answer(f"Ключевое слово '{keyword}' успешно добавлено для отслеживания!")
+            else:
+                await message.answer(f"Ключевое слово '{keyword}' уже отслеживается.")
+        else:
+            await message.answer("Ключевое слово не может быть пустым.")
+    
+    await callback_query.answer()
+
+# Обработчик запроса списка ключевых слов
+@dp.callback_query(lambda c: c.data == 'list_keywords')
+async def list_keywords(callback_query: types.CallbackQuery):
+    keywords = get_keywords()
+    
+    if keywords:
+        keyword_text = "🔑 **Список отслеживаемых ключевых слов:**\n\n"
+        
+        for i, keyword in enumerate(keywords, 1):
+            keyword_text += f"{i}. **{keyword}**\n"
+        
+        await bot.send_message(
+            callback_query.from_user.id,
+            keyword_text
+        )
+    else:
+        await bot.send_message(
+            callback_query.from_user.id,
+            "Нет отслеживаемых ключевых слов."
+        )
+    
+    await callback_query.answer()
+
+# Обработчик для команды "Помощь"
+@dp.message(lambda message: message.text == "Помощь")
+async def show_help(message: types.Message):
+    help_text = """
+📚 **Справка по использованию бота:**
+
+**Основные функции:**
+- **Экспорт постов** - выгрузка постов из отслеживаемых каналов
+- **Экспорт комментариев** - выгрузка комментариев к постам
+- **Экспорт сообщений** - выгрузка сообщений из групп
+- **Экспорт всего контента** - полный экспорт данных
+
+**Аналитика:**
+- **Статистика** - просмотр основных показателей и графиков
+- **Поиск контента** - поиск по всем собранным данным
+
+**Управление:**
+- **Управление источниками** - добавление и просмотр каналов/групп для мониторинга
+- **Ключевые слова** - настройка отслеживаемых ключевых слов
+
+**Как это работает:**
+Бот собирает данные из указанных источников, сохраняет их в базу данных и позволяет экспортировать или анализировать информацию. При обнаружении ключевых слов в контенте бот отправляет уведомления администраторам.
+
+**Примечание:** Для корректной работы бот должен быть участником отслеживаемых каналов/групп.
+"""
+    await message.answer(help_text)
+
+# Обработчик для команды "Настройки"
+@dp.message(lambda message: message.text == "Настройки")
+async def show_settings(message: types.Message):
+    settings_text = """
+⚙️ **Настройки бота:**
+
+В данный момент доступны следующие настройки:
+
+1. **Управление источниками** - добавление и удаление отслеживаемых каналов/групп
+2. **Ключевые слова** - настройка списка отслеживаемых слов и фраз
+
+Для изменения настроек выберите соответствующий пункт в главном меню.
+
+**Администрирование:**
+Для получения расширенных прав администратора, свяжитесь с владельцем бота.
+"""
+    await message.answer(settings_text)
+
+# Запуск бота
+async def main():
+    # Инициализация базы данных
+    initialize_database()
+    
+    # Запуск Telethon клиента
+    await client.start()
+    
+    # Запуск aiogram диспетчера
+    await dp.start_polling(bot)
+
+if __name__ == "__main__":
+    asyncio.run(main())
