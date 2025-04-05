@@ -26,7 +26,7 @@
 pip install -r requirements.txt
 ```
 
-3. Создайте файл `config.py` со следующим содержанием:
+3. Добавьте в файл `config.py` свои данные:
 
 ```python
 api_id = 'ваш_api_id'  # Получите на сайте my.telegram.org
