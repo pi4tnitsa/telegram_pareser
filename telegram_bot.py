@@ -78,9 +78,7 @@ def init_db():
         date TEXT,
         channel_name TEXT,
         content TEXT,
-        message_id INTEGER,
-        views INTEGER,
-        forwards INTEGER
+        message_id INTEGER
     )
     ''')
     
@@ -243,7 +241,7 @@ def export_data_to_excel(data_type, start_date, end_date):
         ws_posts.title = "Posts"
         
         # Add headers
-        headers = ["Date", "Channel", "Content", "Views", "Forwards"]
+        headers = ["Date", "Channel", "Content"]
         for col_num, header in enumerate(headers, 1):
             cell = ws_posts.cell(row=1, column=col_num)
             cell.value = header
@@ -253,7 +251,7 @@ def export_data_to_excel(data_type, start_date, end_date):
         
         # Get posts data
         cursor.execute(
-            "SELECT date, channel_name, content, views, forwards FROM posts WHERE date BETWEEN ? AND ?",
+            "SELECT date, channel_name, content FROM posts WHERE date BETWEEN ? AND ?",
             (start_date_str, end_date_str)
         )
         posts = cursor.fetchall()
@@ -359,7 +357,7 @@ def export_data_to_json(data_type, start_date, end_date):
     if data_type == "posts" or data_type == "all":
         # Export posts
         cursor.execute(
-            "SELECT date, channel_name, content, views, forwards FROM posts WHERE date BETWEEN ? AND ?",
+            "SELECT date, channel_name, content FROM posts WHERE date BETWEEN ? AND ?",
             (start_date_str, end_date_str)
         )
         posts = cursor.fetchall()
@@ -369,9 +367,7 @@ def export_data_to_json(data_type, start_date, end_date):
             posts_data.append({
                 "date": post[0],
                 "channel": post[1],
-                "content": post[2],
-                "views": post[3],
-                "forwards": post[4]
+                "content": post[2]
             })
         
         data["posts"] = posts_data
@@ -655,8 +651,8 @@ async def collect_channel_content():
                 if source_type == "channel":
                     # Add post to database
                     cursor.execute(
-                        "INSERT INTO posts (date, channel_name, content, message_id, views, forwards) VALUES (?, ?, ?, ?, ?, ?)",
-                        (message_date, source_name, message_content, message.id, message.views, message.forwards)
+                        "INSERT INTO posts (date, channel_name, content, message_id) VALUES (?, ?, ?, ?)",
+                        (message_date, source_name, message_content, message.id)
                     )
                     conn.commit()
                     
@@ -782,4 +778,6 @@ async def process_export_type(callback_query: types.CallbackQuery, state: FSMCon
     
     keyboard = InlineKeyboardMarkup()
     keyboard.add(InlineKeyboardButton("Неделя", callback_data="period_week"))
-    keyboard.add(InlineKeyboardButton("Месяц", callback_data="
+    keyboard.add(InlineKeyboardButton("Месяц", callback_data="period_month"))
+    keyboard.add(InlineKeyboardButton("3 месяца", callback_data="period_three_months"))
+    keyboard.add(InlineKeyboardButton("Все время", callback_data="period_all"))
