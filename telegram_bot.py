@@ -781,3 +781,587 @@ async def process_export_type(callback_query: types.CallbackQuery, state: FSMCon
     keyboard.add(InlineKeyboardButton("Месяц", callback_data="period_month"))
     keyboard.add(InlineKeyboardButton("3 месяца", callback_data="period_three_months"))
     keyboard.add(InlineKeyboardButton("Все время", callback_data="period_all"))
+# Continue from where the code left off
+
+@dp.callback_query_handler(lambda c: c.data.startswith('period_'), state=ExportStates.select_period)
+async def process_export_period(callback_query: types.CallbackQuery, state: FSMContext):
+    """Process selected period for export"""
+    await callback_query.answer()
+    
+    period = callback_query.data.split('_')[1]
+    
+    if period == "custom":
+        await callback_query.message.edit_text("Введите начальную дату в формате ГГГГ-ММ-ДД:")
+        await ExportStates.custom_period_start.set()
+    else:
+        await state.update_data(period=period)
+        
+        # Get start and end dates based on period
+        start_date, end_date = get_period_dates(period)
+        await state.update_data(start_date=start_date, end_date=end_date)
+        
+        # Ask for export format
+        keyboard = InlineKeyboardMarkup()
+        keyboard.add(InlineKeyboardButton("Excel", callback_data="format_excel"))
+        keyboard.add(InlineKeyboardButton("JSON", callback_data="format_json"))
+        keyboard.add(InlineKeyboardButton("« Назад", callback_data="back_to_period"))
+        
+        await callback_query.message.edit_text(
+            f"Выбран период: {period}. Выберите формат экспорта:",
+            reply_markup=keyboard
+        )
+        await ExportStates.select_format.set()
+
+@dp.message_handler(state=ExportStates.custom_period_start)
+async def process_custom_start_date(message: types.Message, state: FSMContext):
+    """Process custom start date"""
+    try:
+        start_date = datetime.strptime(message.text, "%Y-%m-%d").strftime("%Y-%m-%d")
+        await state.update_data(start_date=start_date)
+        
+        await message.answer("Введите конечную дату в формате ГГГГ-ММ-ДД:")
+        await ExportStates.custom_period_end.set()
+    except ValueError:
+        await message.answer("Неверный формат даты. Пожалуйста, используйте формат ГГГГ-ММ-ДД:")
+
+@dp.message_handler(state=ExportStates.custom_period_end)
+async def process_custom_end_date(message: types.Message, state: FSMContext):
+    """Process custom end date"""
+    try:
+        end_date = datetime.strptime(message.text, "%Y-%m-%d").strftime("%Y-%m-%d")
+        await state.update_data(end_date=end_date)
+        
+        # Ask for export format
+        keyboard = InlineKeyboardMarkup()
+        keyboard.add(InlineKeyboardButton("Excel", callback_data="format_excel"))
+        keyboard.add(InlineKeyboardButton("JSON", callback_data="format_json"))
+        keyboard.add(InlineKeyboardButton("« Назад", callback_data="back_to_period"))
+        
+        data = await state.get_data()
+        
+        await message.answer(
+            f"Выбран период: с {data['start_date']} по {end_date}. Выберите формат экспорта:",
+            reply_markup=keyboard
+        )
+        await ExportStates.select_format.set()
+    except ValueError:
+        await message.answer("Неверный формат даты. Пожалуйста, используйте формат ГГГГ-ММ-ДД:")
+
+@dp.callback_query_handler(lambda c: c.data.startswith('format_'), state=ExportStates.select_format)
+async def process_export_format(callback_query: types.CallbackQuery, state: FSMContext):
+    """Process selected export format and generate export file"""
+    await callback_query.answer()
+    
+    export_format = callback_query.data.split('_')[1]
+    data = await state.get_data()
+    
+    data_type = data.get('data_type')
+    start_date = data.get('start_date')
+    end_date = data.get('end_date')
+    
+    await callback_query.message.edit_text("⏳ Подготовка данных для экспорта...")
+    
+    try:
+        if export_format == "excel":
+            filename = export_data_to_excel(data_type, start_date, end_date)
+            
+            with open(filename, 'rb') as file:
+                await bot.send_document(
+                    callback_query.from_user.id,
+                    types.InputFile(file, filename=f"export_{data_type}_{start_date}_to_{end_date}.xlsx"),
+                    caption=f"Экспорт данных ({data_type}) с {start_date} по {end_date}"
+                )
+        else:  # JSON
+            filename = export_data_to_json(data_type, start_date, end_date)
+            
+            with open(filename, 'rb') as file:
+                await bot.send_document(
+                    callback_query.from_user.id,
+                    types.InputFile(file, filename=f"export_{data_type}_{start_date}_to_{end_date}.json"),
+                    caption=f"Экспорт данных ({data_type}) с {start_date} по {end_date}"
+                )
+        
+        # Clean up temp file
+        try:
+            os.remove(filename)
+        except:
+            pass
+        
+        # Reset state
+        await state.finish()
+        
+        # Show main menu
+        keyboard = ReplyKeyboardMarkup(resize_keyboard=True)
+        keyboard.add(KeyboardButton("📊 Статистика"))
+        keyboard.add(KeyboardButton("🔍 Поиск контента"))
+        keyboard.add(KeyboardButton("📤 Экспорт данных"))
+        keyboard.add(KeyboardButton("📋 Управление источниками"))
+        keyboard.add(KeyboardButton("🔑 Ключевые слова"))
+        
+        await bot.send_message(
+            callback_query.from_user.id,
+            "✅ Экспорт завершен. Чем еще могу помочь?",
+            reply_markup=keyboard
+        )
+    
+    except Exception as e:
+        logger.error(f"Error during export: {e}")
+        await bot.send_message(
+            callback_query.from_user.id,
+            f"❌ Ошибка при экспорте данных: {e}"
+        )
+        await state.finish()
+
+@dp.callback_query_handler(lambda c: c.data == "back_to_main", state="*")
+async def back_to_main(callback_query: types.CallbackQuery, state: FSMContext):
+    """Return to main menu"""
+    await callback_query.answer()
+    await state.finish()
+    
+    keyboard = ReplyKeyboardMarkup(resize_keyboard=True)
+    keyboard.add(KeyboardButton("📊 Статистика"))
+    keyboard.add(KeyboardButton("🔍 Поиск контента"))
+    keyboard.add(KeyboardButton("📤 Экспорт данных"))
+    keyboard.add(KeyboardButton("📋 Управление источниками"))
+    keyboard.add(KeyboardButton("🔑 Ключевые слова"))
+    
+    await callback_query.message.answer("Главное меню:", reply_markup=keyboard)
+    await callback_query.message.delete()
+
+@dp.callback_query_handler(lambda c: c.data == "back_to_period", state=ExportStates.select_format)
+async def back_to_period_selection(callback_query: types.CallbackQuery, state: FSMContext):
+    """Return to period selection"""
+    await callback_query.answer()
+    
+    keyboard = InlineKeyboardMarkup()
+    keyboard.add(InlineKeyboardButton("Неделя", callback_data="period_week"))
+    keyboard.add(InlineKeyboardButton("Месяц", callback_data="period_month"))
+    keyboard.add(InlineKeyboardButton("3 месяца", callback_data="period_three_months"))
+    keyboard.add(InlineKeyboardButton("Все время", callback_data="period_all"))
+    keyboard.add(InlineKeyboardButton("Свой период", callback_data="period_custom"))
+    keyboard.add(InlineKeyboardButton("« Назад", callback_data="back_to_export_type"))
+    
+    await callback_query.message.edit_text("Выберите период:", reply_markup=keyboard)
+    await ExportStates.select_period.set()
+
+@dp.callback_query_handler(lambda c: c.data == "back_to_export_type", state=ExportStates.select_period)
+async def back_to_export_type_selection(callback_query: types.CallbackQuery, state: FSMContext):
+    """Return to export type selection"""
+    await callback_query.answer()
+    
+    keyboard = InlineKeyboardMarkup()
+    keyboard.add(InlineKeyboardButton("Посты", callback_data="export_posts"))
+    keyboard.add(InlineKeyboardButton("Комментарии", callback_data="export_comments"))
+    keyboard.add(InlineKeyboardButton("Сообщения из групп", callback_data="export_messages"))
+    keyboard.add(InlineKeyboardButton("Все данные", callback_data="export_all"))
+    keyboard.add(InlineKeyboardButton("« Назад", callback_data="back_to_main"))
+    
+    await callback_query.message.edit_text("Выберите тип данных для экспорта:", reply_markup=keyboard)
+    await ExportStates.select_data_type.set()
+
+# Source management handlers
+@dp.message_handler(lambda message: message.text == "📋 Управление источниками")
+async def manage_sources_command(message: types.Message):
+    """Show source management options"""
+    keyboard = InlineKeyboardMarkup()
+    keyboard.add(InlineKeyboardButton("➕ Добавить источник", callback_data="add_source"))
+    keyboard.add(InlineKeyboardButton("📃 Список источников", callback_data="list_sources"))
+    keyboard.add(InlineKeyboardButton("❌ Удалить источник", callback_data="delete_source"))
+    keyboard.add(InlineKeyboardButton("« Назад", callback_data="back_to_main"))
+    
+    await message.answer("Управление источниками:", reply_markup=keyboard)
+
+@dp.callback_query_handler(lambda c: c.data == "add_source")
+async def add_source_command(callback_query: types.CallbackQuery):
+    """Start add source flow"""
+    await callback_query.answer()
+    
+    await callback_query.message.edit_text(
+        "Введите имя источника (имя канала или группы без @):"
+    )
+    await SourceStates.add_source.set()
+
+@dp.message_handler(state=SourceStates.add_source)
+async def process_source_name(message: types.Message, state: FSMContext):
+    """Process source name input"""
+    source_name = message.text.strip()
+    
+    if source_name.startswith('@'):
+        source_name = source_name[1:]
+    
+    await state.update_data(source_name=source_name)
+    
+    keyboard = InlineKeyboardMarkup()
+    keyboard.add(InlineKeyboardButton("Канал", callback_data="source_type_channel"))
+    keyboard.add(InlineKeyboardButton("Группа", callback_data="source_type_group"))
+    
+    await message.answer(f"Выберите тип источника для '{source_name}':", reply_markup=keyboard)
+
+@dp.callback_query_handler(lambda c: c.data.startswith('source_type_'), state=SourceStates.add_source)
+async def process_source_type(callback_query: types.CallbackQuery, state: FSMContext):
+    """Process source type selection"""
+    await callback_query.answer()
+    
+    source_type = callback_query.data.split('_')[2]
+    data = await state.get_data()
+    source_name = data.get('source_name')
+    
+    result = add_source(source_name, source_type)
+    
+    if result:
+        await callback_query.message.edit_text(f"✅ Источник '{source_name}' успешно добавлен!")
+    else:
+        await callback_query.message.edit_text(f"❌ Источник '{source_name}' уже существует или произошла ошибка.")
+    
+    await state.finish()
+    
+    # Show sources management menu after delay
+    await asyncio.sleep(2)
+    keyboard = InlineKeyboardMarkup()
+    keyboard.add(InlineKeyboardButton("➕ Добавить источник", callback_data="add_source"))
+    keyboard.add(InlineKeyboardButton("📃 Список источников", callback_data="list_sources"))
+    keyboard.add(InlineKeyboardButton("❌ Удалить источник", callback_data="delete_source"))
+    keyboard.add(InlineKeyboardButton("« Назад", callback_data="back_to_main"))
+    
+    await callback_query.message.edit_text("Управление источниками:", reply_markup=keyboard)
+
+@dp.callback_query_handler(lambda c: c.data == "list_sources")
+async def list_sources_command(callback_query: types.CallbackQuery):
+    """List all monitored sources"""
+    await callback_query.answer()
+    
+    sources = get_sources()
+    
+    if not sources:
+        await callback_query.message.edit_text(
+            "📂 Список источников пуст.\n\n"
+            "Нажмите '➕ Добавить источник' для добавления нового источника.",
+            reply_markup=InlineKeyboardMarkup().add(
+                InlineKeyboardButton("« Назад", callback_data="back_to_sources")
+            )
+        )
+        return
+    
+    sources_text = "📂 Список отслеживаемых источников:\n\n"
+    
+    for i, (name, type_) in enumerate(sources, 1):
+        source_type = "Канал" if type_ == "channel" else "Группа"
+        sources_text += f"{i}. {name} - {source_type}\n"
+    
+    keyboard = InlineKeyboardMarkup()
+    keyboard.add(InlineKeyboardButton("« Назад", callback_data="back_to_sources"))
+    
+    await callback_query.message.edit_text(sources_text, reply_markup=keyboard)
+
+@dp.callback_query_handler(lambda c: c.data == "delete_source")
+async def delete_source_command(callback_query: types.CallbackQuery):
+    """Start delete source flow"""
+    await callback_query.answer()
+    
+    sources = get_sources()
+    
+    if not sources:
+        await callback_query.message.edit_text(
+            "📂 Список источников пуст.\n\n"
+            "Нет источников для удаления.",
+            reply_markup=InlineKeyboardMarkup().add(
+                InlineKeyboardButton("« Назад", callback_data="back_to_sources")
+            )
+        )
+        return
+    
+    keyboard = InlineKeyboardMarkup(row_width=1)
+    
+    for name, _ in sources:
+        keyboard.add(InlineKeyboardButton(name, callback_data=f"delete_{name}"))
+    
+    keyboard.add(InlineKeyboardButton("« Назад", callback_data="back_to_sources"))
+    
+    await callback_query.message.edit_text("Выберите источник для удаления:", reply_markup=keyboard)
+
+@dp.callback_query_handler(lambda c: c.data.startswith('delete_'))
+async def confirm_delete_source(callback_query: types.CallbackQuery, state: FSMContext):
+    """Confirm source deletion"""
+    await callback_query.answer()
+    
+    source_name = callback_query.data[7:]  # Remove 'delete_' prefix
+    await state.update_data(source_name=source_name)
+    
+    keyboard = InlineKeyboardMarkup()
+    keyboard.add(InlineKeyboardButton("✅ Да", callback_data="confirm_delete_yes"))
+    keyboard.add(InlineKeyboardButton("❌ Нет", callback_data="confirm_delete_no"))
+    
+    await callback_query.message.edit_text(
+        f"Вы уверены, что хотите удалить источник '{source_name}'?",
+        reply_markup=keyboard
+    )
+    await SourceStates.confirm_delete.set()
+
+@dp.callback_query_handler(lambda c: c.data.startswith('confirm_delete_'), state=SourceStates.confirm_delete)
+async def process_delete_confirmation(callback_query: types.CallbackQuery, state: FSMContext):
+    """Process delete confirmation"""
+    await callback_query.answer()
+    
+    data = await state.get_data()
+    source_name = data.get('source_name')
+    
+    if callback_query.data == "confirm_delete_yes":
+        delete_source(source_name)
+        await callback_query.message.edit_text(f"✅ Источник '{source_name}' удален.")
+    else:
+        await callback_query.message.edit_text("❌ Удаление отменено.")
+    
+    await state.finish()
+    
+    # Show sources management menu after delay
+    await asyncio.sleep(2)
+    keyboard = InlineKeyboardMarkup()
+    keyboard.add(InlineKeyboardButton("➕ Добавить источник", callback_data="add_source"))
+    keyboard.add(InlineKeyboardButton("📃 Список источников", callback_data="list_sources"))
+    keyboard.add(InlineKeyboardButton("❌ Удалить источник", callback_data="delete_source"))
+    keyboard.add(InlineKeyboardButton("« Назад", callback_data="back_to_main"))
+    
+    await callback_query.message.edit_text("Управление источниками:", reply_markup=keyboard)
+
+@dp.callback_query_handler(lambda c: c.data == "back_to_sources")
+async def back_to_sources_menu(callback_query: types.CallbackQuery):
+    """Return to sources management"""
+    await callback_query.answer()
+    
+    keyboard = InlineKeyboardMarkup()
+    keyboard.add(InlineKeyboardButton("➕ Добавить источник", callback_data="add_source"))
+    keyboard.add(InlineKeyboardButton("📃 Список источников", callback_data="list_sources"))
+    keyboard.add(InlineKeyboardButton("❌ Удалить источник", callback_data="delete_source"))
+    keyboard.add(InlineKeyboardButton("« Назад", callback_data="back_to_main"))
+    
+    await callback_query.message.edit_text("Управление источниками:", reply_markup=keyboard)
+
+# Keywords management handlers
+@dp.message_handler(lambda message: message.text == "🔑 Ключевые слова")
+async def manage_keywords_command(message: types.Message):
+    """Show keywords management options"""
+    keyboard = InlineKeyboardMarkup()
+    keyboard.add(InlineKeyboardButton("➕ Добавить ключевое слово", callback_data="add_keyword"))
+    keyboard.add(InlineKeyboardButton("📃 Список ключевых слов", callback_data="list_keywords"))
+    keyboard.add(InlineKeyboardButton("❌ Удалить ключевое слово", callback_data="delete_keyword"))
+    keyboard.add(InlineKeyboardButton("« Назад", callback_data="back_to_main"))
+    
+    await message.answer("Управление ключевыми словами:", reply_markup=keyboard)
+
+@dp.callback_query_handler(lambda c: c.data == "add_keyword")
+async def add_keyword_command(callback_query: types.CallbackQuery):
+    """Start add keyword flow"""
+    await callback_query.answer()
+    
+    await callback_query.message.edit_text(
+        "Введите ключевое слово для отслеживания:"
+    )
+    await KeywordStates.add_keyword.set()
+
+@dp.message_handler(state=KeywordStates.add_keyword)
+async def process_keyword(message: types.Message, state: FSMContext):
+    """Process keyword input"""
+    keyword = message.text.strip().lower()
+    
+    result = add_keyword(keyword)
+    
+    if result:
+        await message.answer(f"✅ Ключевое слово '{keyword}' успешно добавлено!")
+    else:
+        await message.answer(f"❌ Ключевое слово '{keyword}' уже существует или произошла ошибка.")
+    
+    await state.finish()
+    
+    # Show keywords management menu
+    keyboard = InlineKeyboardMarkup()
+    keyboard.add(InlineKeyboardButton("➕ Добавить ключевое слово", callback_data="add_keyword"))
+    keyboard.add(InlineKeyboardButton("📃 Список ключевых слов", callback_data="list_keywords"))
+    keyboard.add(InlineKeyboardButton("❌ Удалить ключевое слово", callback_data="delete_keyword"))
+    keyboard.add(InlineKeyboardButton("« Назад", callback_data="back_to_main"))
+    
+    await message.answer("Управление ключевыми словами:", reply_markup=keyboard)
+
+@dp.callback_query_handler(lambda c: c.data == "list_keywords")
+async def list_keywords_command(callback_query: types.CallbackQuery):
+    """List all monitored keywords"""
+    await callback_query.answer()
+    
+    keywords = get_keywords()
+    
+    if not keywords:
+        await callback_query.message.edit_text(
+            "🔑 Список ключевых слов пуст.\n\n"
+            "Нажмите '➕ Добавить ключевое слово' для добавления нового ключевого слова.",
+            reply_markup=InlineKeyboardMarkup().add(
+                InlineKeyboardButton("« Назад", callback_data="back_to_keywords")
+            )
+        )
+        return
+    
+    keywords_text = "🔑 Список отслеживаемых ключевых слов:\n\n"
+    
+    for i, keyword in enumerate(keywords, 1):
+        keywords_text += f"{i}. {keyword}\n"
+    
+    keyboard = InlineKeyboardMarkup()
+    keyboard.add(InlineKeyboardButton("« Назад", callback_data="back_to_keywords"))
+    
+    await callback_query.message.edit_text(keywords_text, reply_markup=keyboard)
+
+@dp.callback_query_handler(lambda c: c.data == "delete_keyword")
+async def delete_keyword_command(callback_query: types.CallbackQuery):
+    """Start delete keyword flow"""
+    await callback_query.answer()
+    
+    keywords = get_keywords()
+    
+    if not keywords:
+        await callback_query.message.edit_text(
+            "🔑 Список ключевых слов пуст.\n\n"
+            "Нет ключевых слов для удаления.",
+            reply_markup=InlineKeyboardMarkup().add(
+                InlineKeyboardButton("« Назад", callback_data="back_to_keywords")
+            )
+        )
+        return
+    
+    keyboard = InlineKeyboardMarkup(row_width=1)
+    
+    for keyword in keywords:
+        keyboard.add(InlineKeyboardButton(keyword, callback_data=f"delete_kw_{keyword}"))
+    
+    keyboard.add(InlineKeyboardButton("« Назад", callback_data="back_to_keywords"))
+    
+    await callback_query.message.edit_text("Выберите ключевое слово для удаления:", reply_markup=keyboard)
+
+@dp.callback_query_handler(lambda c: c.data.startswith('delete_kw_'))
+async def confirm_delete_keyword(callback_query: types.CallbackQuery, state: FSMContext):
+    """Confirm keyword deletion"""
+    await callback_query.answer()
+    
+    keyword = callback_query.data[10:]  # Remove 'delete_kw_' prefix
+    await state.update_data(keyword=keyword)
+    
+    keyboard = InlineKeyboardMarkup()
+    keyboard.add(InlineKeyboardButton("✅ Да", callback_data="confirm_kw_delete_yes"))
+    keyboard.add(InlineKeyboardButton("❌ Нет", callback_data="confirm_kw_delete_no"))
+    
+    await callback_query.message.edit_text(
+        f"Вы уверены, что хотите удалить ключевое слово '{keyword}'?",
+        reply_markup=keyboard
+    )
+    await KeywordStates.confirm_delete.set()
+
+@dp.callback_query_handler(lambda c: c.data.startswith('confirm_kw_delete_'), state=KeywordStates.confirm_delete)
+async def process_delete_keyword_confirmation(callback_query: types.CallbackQuery, state: FSMContext):
+    """Process delete keyword confirmation"""
+    await callback_query.answer()
+    
+    data = await state.get_data()
+    keyword = data.get('keyword')
+    
+    if callback_query.data == "confirm_kw_delete_yes":
+        delete_keyword(keyword)
+        await callback_query.message.edit_text(f"✅ Ключевое слово '{keyword}' удалено.")
+    else:
+        await callback_query.message.edit_text("❌ Удаление отменено.")
+    
+    await state.finish()
+    
+    # Show keywords management menu after delay
+    await asyncio.sleep(2)
+    keyboard = InlineKeyboardMarkup()
+    keyboard.add(InlineKeyboardButton("➕ Добавить ключевое слово", callback_data="add_keyword"))
+    keyboard.add(InlineKeyboardButton("📃 Список ключевых слов", callback_data="list_keywords"))
+    keyboard.add(InlineKeyboardButton("❌ Удалить ключевое слово", callback_data="delete_keyword"))
+    keyboard.add(InlineKeyboardButton("« Назад", callback_data="back_to_main"))
+    
+    await callback_query.message.edit_text("Управление ключевыми словами:", reply_markup=keyboard)
+
+@dp.callback_query_handler(lambda c: c.data == "back_to_keywords")
+async def back_to_keywords_menu(callback_query: types.CallbackQuery):
+    """Return to keywords management"""
+    await callback_query.answer()
+    
+    keyboard = InlineKeyboardMarkup()
+    keyboard.add(InlineKeyboardButton("➕ Добавить ключевое слово", callback_data="add_keyword"))
+    keyboard.add(InlineKeyboardButton("📃 Список ключевых слов", callback_data="list_keywords"))
+    keyboard.add(InlineKeyboardButton("❌ Удалить ключевое слово", callback_data="delete_keyword"))
+    keyboard.add(InlineKeyboardButton("« Назад", callback_data="back_to_main"))
+    
+    await callback_query.message.edit_text("Управление ключевыми словами:", reply_markup=keyboard)
+
+# Search content handlers
+@dp.message_handler(lambda message: message.text == "🔍 Поиск контента")
+async def search_content_command(message: types.Message):
+    """Start search content flow"""
+    await message.answer("Введите поисковый запрос:")
+    await SearchStates.enter_query.set()
+
+@dp.message_handler(state=SearchStates.enter_query)
+async def process_search_query(message: types.Message, state: FSMContext):
+    """Process search query"""
+    query = message.text.strip()
+    
+    if not query:
+        await message.answer("Поисковый запрос не может быть пустым. Пожалуйста, введите поисковый запрос:")
+        return
+    
+    await state.update_data(query=query)
+    
+    keyboard = InlineKeyboardMarkup()
+    keyboard.add(InlineKeyboardButton("Неделя", callback_data="search_period_week"))
+    keyboard.add(InlineKeyboardButton("Месяц", callback_data="search_period_month"))
+    keyboard.add(InlineKeyboardButton("3 месяца", callback_data="search_period_three_months"))
+    keyboard.add(InlineKeyboardButton("Все время", callback_data="search_period_all"))
+    keyboard.add(InlineKeyboardButton("Свой период", callback_data="search_period_custom"))
+    
+    await message.answer(f"Выберите период для поиска '{query}':", reply_markup=keyboard)
+    await SearchStates.select_period.set()
+
+@dp.callback_query_handler(lambda c: c.data.startswith('search_period_'), state=SearchStates.select_period)
+async def process_search_period(callback_query: types.CallbackQuery, state: FSMContext):
+    """Process selected period for search"""
+    await callback_query.answer()
+    
+    period = callback_query.data.split('_')[2]
+    
+    if period == "custom":
+        await callback_query.message.edit_text("Введите начальную дату в формате ГГГГ-ММ-ДД:")
+        await SearchStates.custom_period_start.set()
+    else:
+        # Get start and end dates based on period
+        start_date, end_date = get_period_dates(period)
+        
+        # Get search query
+        data = await state.get_data()
+        query = data.get('query')
+        
+        await callback_query.message.edit_text("🔍 Выполняется поиск, пожалуйста, подождите...")
+        
+        # Perform search
+        results = search_content(query, start_date, end_date)
+        
+        if not results:
+            await callback_query.message.edit_text(
+                f"❌ По запросу '{query}' ничего не найдено.",
+                reply_markup=InlineKeyboardMarkup().add(
+                    InlineKeyboardButton("🔙 Новый поиск", callback_data="new_search")
+                )
+            )
+        else:
+            # Format results
+            result_text = f"🔍 Результаты поиска по запросу '{query}':\n\n"
+            
+            for i, (date, source, content, content_type) in enumerate(results[:15], 1):  # Limit to 15 results
+                formatted_date = date.split()[0] if ' ' in date else date
+                result_text += f"{i}. [{formatted_date}] {source} ({content_type}):\n{content[:100]}...\n\n"
+            
+            if len(results) > 15:
+                result_text += f"\nПоказаны первые 15 из {len(results)} результатов."
+            
+            # Split message if it's too long
+            if len(result_text) > 4000:
+                chunks = [result_text[i:i+4000] for i in range(0, len(result_text), 4000)]
+                for chunk in chunks:
+                    await bot.send_message(callback_query.from_user.id, chunk
