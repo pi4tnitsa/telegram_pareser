@@ -12,32 +12,33 @@ from telethon import TelegramClient, events
 from telethon.tl.types import PeerChannel, PeerUser
 from config import api_hash, api_id, BOT_TOKEN
 
-# Initialize bot and dispatcher
+# Инициализация бота и диспетчера
 bot = Bot(token=BOT_TOKEN)
 dp = Dispatcher()
 
-# Initialize Telethon client
+# Инициализация клиента Telethon
 client = TelegramClient('session_name', api_id, api_hash)
 
-# Path to SQLite database
+# Путь к базе данных SQLite
 DB_FILE = 'telegram_content.db'
 
-# Database initialization
+# Инициализация базы данных
 def initialize_database():
     conn = sqlite3.connect(DB_FILE)
     cursor = conn.cursor()
     
-    # Create posts table
+    # Создание таблицы постов
     cursor.execute('''
     CREATE TABLE IF NOT EXISTS posts (
         id INTEGER PRIMARY KEY AUTOINCREMENT,
         date TEXT,
         channel_name TEXT,
-        content TEXT
+        content TEXT,
+        message_id INTEGER
     )
     ''')
     
-    # Create comments table with reference to posts
+    # Создание таблицы комментариев со ссылкой на посты
     cursor.execute('''
     CREATE TABLE IF NOT EXISTS comments (
         id INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -46,11 +47,12 @@ def initialize_database():
         post_content TEXT,
         comment TEXT,
         user_id INTEGER,
-        username TEXT
+        username TEXT,
+        post_id INTEGER
     )
     ''')
     
-    # Create messages table for group chat messages
+    # Создание таблицы сообщений для групповых чатов
     cursor.execute('''
     CREATE TABLE IF NOT EXISTS messages (
         id INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -64,28 +66,28 @@ def initialize_database():
     
     conn.commit()
     conn.close()
-    print("Database initialized successfully")
+    print("База данных успешно инициализирована")
 
-# Functions to add data to respective tables
-def add_post(date, channel_name, content):
+# Функции для добавления данных в соответствующие таблицы
+def add_post(date, channel_name, content, message_id):
     conn = sqlite3.connect(DB_FILE)
     cursor = conn.cursor()
     cursor.execute('''
-    INSERT INTO posts (date, channel_name, content)
-    VALUES (?, ?, ?)
-    ''', (date, channel_name, content))
+    INSERT INTO posts (date, channel_name, content, message_id)
+    VALUES (?, ?, ?, ?)
+    ''', (date, channel_name, content, message_id))
     post_id = cursor.lastrowid
     conn.commit()
     conn.close()
     return post_id
 
-def add_comment(date, channel_name, post_content, comment, user_id, username):
+def add_comment(date, channel_name, post_content, comment, user_id, username, post_id=None):
     conn = sqlite3.connect(DB_FILE)
     cursor = conn.cursor()
     cursor.execute('''
-    INSERT INTO comments (date, channel_name, post_content, comment, user_id, username)
-    VALUES (?, ?, ?, ?, ?, ?)
-    ''', (date, channel_name, post_content, comment, user_id, username))
+    INSERT INTO comments (date, channel_name, post_content, comment, user_id, username, post_id)
+    VALUES (?, ?, ?, ?, ?, ?, ?)
+    ''', (date, channel_name, post_content, comment, user_id, username, post_id))
     comment_id = cursor.lastrowid
     conn.commit()
     conn.close()
@@ -103,7 +105,19 @@ def add_message(date, source, content, user_id, username):
     conn.close()
     return message_id
 
-# Event handler for new messages in channels and groups
+# Функция для поиска поста по id сообщения
+def find_post_by_message_id(channel_name, message_id):
+    conn = sqlite3.connect(DB_FILE)
+    cursor = conn.cursor()
+    cursor.execute('''
+    SELECT id, content FROM posts 
+    WHERE channel_name = ? AND message_id = ?
+    ''', (channel_name, message_id))
+    result = cursor.fetchone()
+    conn.close()
+    return result
+
+# Обработчик событий для новых сообщений в каналах и группах
 @client.on(events.NewMessage)
 async def new_content_listener(event):
     if isinstance(event.peer_id, PeerChannel):
@@ -111,13 +125,13 @@ async def new_content_listener(event):
             channel = await client.get_entity(event.peer_id)
             channel_name = channel.title
             
-            # Get Moscow time for the post
+            # Получение московского времени для поста
             post_date_utc = event.message.date
             moscow_tz = pytz.timezone('Europe/Moscow')
             post_date_moscow = post_date_utc.astimezone(moscow_tz)
             post_date = post_date_moscow.strftime('%Y-%m-%d %H:%M:%S')
             
-            # Get sender info
+            # Получение информации о отправителе
             sender = await event.get_sender()
             user_id = None
             username = None
@@ -125,48 +139,61 @@ async def new_content_listener(event):
                 user_id = sender.id
                 username = sender.username or f"User_{sender.id}"
             
-            content = event.message.text or "Message without text"
+            content = event.message.text or "Сообщение без текста"
             
-            # Check if this is a comment to a post
+            # Проверка, является ли это комментарием к посту
             if event.message.reply_to:
                 try:
-                    # Get the original post
-                    replied_msg = await client.get_messages(event.peer_id, ids=event.message.reply_to.reply_to_msg_id)
-                    original_post = replied_msg.text or "Message without text"
+                    # Получение оригинального поста
+                    original_msg_id = event.message.reply_to.reply_to_msg_id
                     
-                    # This is a comment
-                    add_comment(post_date, channel_name, original_post, content, user_id, username)
-                    print(f"Added comment in channel {channel_name} at {post_date}")
+                    # Поиск поста в базе данных
+                    post_info = find_post_by_message_id(channel_name, original_msg_id)
+                    
+                    if post_info:
+                        # Если пост найден в базе данных, используем его
+                        post_id, original_post = post_info
+                    else:
+                        # Иначе запрашиваем сообщение из Telegram
+                        replied_msg = await client.get_messages(event.peer_id, ids=original_msg_id)
+                        original_post = replied_msg.text or "Сообщение без текста"
+                        post_id = None
+                    
+                    # Это комментарий
+                    add_comment(post_date, channel_name, original_post, content, user_id, username, post_id)
+                    print(f"Добавлен комментарий в канале {channel_name} в {post_date}")
                 except Exception as e:
-                    print(f"Error processing comment: {e}")
+                    print(f"Ошибка при обработке комментария: {e}")
             else:
-                # Determine if this is a channel post or a group message
+                # Определяем, является ли это постом канала или сообщением группы
                 if event.is_channel and not event.is_group:
-                    # This is a channel post
-                    add_post(post_date, channel_name, content)
-                    print(f"Added post from channel {channel_name} at {post_date}")
+                    # Это пост канала
+                    add_post(post_date, channel_name, content, event.message.id)
+                    print(f"Добавлен пост из канала {channel_name} в {post_date}")
                 elif event.is_group:
-                    # This is a group message
+                    # Это сообщение группы
                     add_message(post_date, channel_name, content, user_id, username)
-                    print(f"Added message from group {channel_name} at {post_date}")
+                    print(f"Добавлено сообщение из группы {channel_name} в {post_date}")
         except Exception as e:
-            print(f"Error processing message: {e}")
+            print(f"Ошибка при обработке сообщения: {e}")
 
-# Command /start
+# Команда /start
 @dp.message(Command("start"))
 async def start(message: types.Message):
     keyboard = ReplyKeyboardMarkup(
         keyboard=[
-            [KeyboardButton(text="Export Posts")],
-            [KeyboardButton(text="Export Comments")],
-            [KeyboardButton(text="Export Messages")],
-            [KeyboardButton(text="Export All Content")]
+            [KeyboardButton(text="Экспорт постов")],
+            [KeyboardButton(text="Экспорт комментариев")],
+            [KeyboardButton(text="Экспорт сообщений")],
+            [KeyboardButton(text="Экспорт всего контента")],
+            [KeyboardButton(text="Статистика")],
+            [KeyboardButton(text="Помощь")]
         ],
         resize_keyboard=True
     )
-    await message.answer("Hello! Choose an action:", reply_markup=keyboard)
+    await message.answer("Привет! Выберите действие:", reply_markup=keyboard)
 
-# Get data from database based on type and date range
+# Получение данных из базы данных по типу и временному диапазону
 def get_data_by_period(data_type, start_date, end_date):
     conn = sqlite3.connect(DB_FILE)
     conn.row_factory = sqlite3.Row
@@ -211,7 +238,60 @@ def get_data_by_period(data_type, start_date, end_date):
     
     return data
 
-# Calculate date range based on period
+# Функция для получения статистики
+def get_statistics():
+    conn = sqlite3.connect(DB_FILE)
+    cursor = conn.cursor()
+    
+    # Общее количество записей в каждой таблице
+    cursor.execute("SELECT COUNT(*) FROM posts")
+    posts_count = cursor.fetchone()[0]
+    
+    cursor.execute("SELECT COUNT(*) FROM comments")
+    comments_count = cursor.fetchone()[0]
+    
+    cursor.execute("SELECT COUNT(*) FROM messages")
+    messages_count = cursor.fetchone()[0]
+    
+    # Топ-5 каналов по количеству постов
+    cursor.execute('''
+    SELECT channel_name, COUNT(*) as count 
+    FROM posts 
+    GROUP BY channel_name 
+    ORDER BY count DESC 
+    LIMIT 5
+    ''')
+    top_channels = cursor.fetchall()
+    
+    # Активность по дням недели
+    cursor.execute('''
+    SELECT strftime('%w', date) as day_of_week, COUNT(*) as count
+    FROM (
+        SELECT date FROM posts
+        UNION ALL
+        SELECT date FROM comments
+        UNION ALL
+        SELECT date FROM messages
+    )
+    GROUP BY day_of_week
+    ORDER BY day_of_week
+    ''')
+    activity_by_day = cursor.fetchall()
+    
+    conn.close()
+    
+    days = ['Воскресенье', 'Понедельник', 'Вторник', 'Среда', 'Четверг', 'Пятница', 'Суббота']
+    activity_formatted = [(days[int(day)], count) for day, count in activity_by_day]
+    
+    return {
+        "total_posts": posts_count,
+        "total_comments": comments_count,
+        "total_messages": messages_count,
+        "top_channels": top_channels,
+        "activity_by_day": activity_formatted
+    }
+
+# Расчет временного диапазона на основе периода
 def get_date_range(period):
     current_date = datetime.now()
     end_date = current_date.strftime('%Y-%m-%d %H:%M:%S')
@@ -223,19 +303,19 @@ def get_date_range(period):
     elif period == "month":
         start_date = (current_date - timedelta(days=30)).strftime('%Y-%m-%d %H:%M:%S')
     else:
-        # Default to one week if period is not recognized
+        # По умолчанию одна неделя, если период не распознан
         start_date = (current_date - timedelta(days=7)).strftime('%Y-%m-%d %H:%M:%S')
     
     return start_date, end_date
 
-# Functions to create Excel files
+# Функции для создания Excel файлов
 def create_excel_file(data_type, data, filename):
     workbook = openpyxl.Workbook()
     sheet = workbook.active
     
     if data_type == "posts":
-        sheet.title = "Posts"
-        headers = ["Date", "Channel Name", "Content"]
+        sheet.title = "Посты"
+        headers = ["Дата", "Название канала", "Содержание"]
         sheet.append(headers)
         
         for post in data:
@@ -247,8 +327,8 @@ def create_excel_file(data_type, data, filename):
             sheet.append(row_data)
     
     elif data_type == "comments":
-        sheet.title = "Comments"
-        headers = ["Date", "Channel Name", "Post Content", "Comment", "User ID", "Username"]
+        sheet.title = "Комментарии"
+        headers = ["Дата", "Название канала", "Содержание поста", "Комментарий", "ID пользователя", "Имя пользователя"]
         sheet.append(headers)
         
         for comment in data:
@@ -263,8 +343,8 @@ def create_excel_file(data_type, data, filename):
             sheet.append(row_data)
     
     elif data_type == "messages":
-        sheet.title = "Messages"
-        headers = ["Date", "Source", "Content", "User ID", "Username"]
+        sheet.title = "Сообщения"
+        headers = ["Дата", "Источник", "Содержание", "ID пользователя", "Имя пользователя"]
         sheet.append(headers)
         
         for message in data:
@@ -277,12 +357,12 @@ def create_excel_file(data_type, data, filename):
             ]
             sheet.append(row_data)
     
-    else:  # All data - create multiple sheets
+    else:  # Все данные - создание нескольких листов
         for content_type, content_data in data.items():
             if content_type == "posts":
                 sheet = workbook.active
-                sheet.title = "Posts"
-                headers = ["Date", "Channel Name", "Content"]
+                sheet.title = "Посты"
+                headers = ["Дата", "Название канала", "Содержание"]
                 sheet.append(headers)
                 
                 for post in content_data:
@@ -297,7 +377,7 @@ def create_excel_file(data_type, data, filename):
                 sheet = workbook.create_sheet(title=content_type.capitalize())
                 
                 if content_type == "comments":
-                    headers = ["Date", "Channel Name", "Post Content", "Comment", "User ID", "Username"]
+                    headers = ["Дата", "Название канала", "Содержание поста", "Комментарий", "ID пользователя", "Имя пользователя"]
                     sheet.append(headers)
                     
                     for comment in content_data:
@@ -312,7 +392,7 @@ def create_excel_file(data_type, data, filename):
                         sheet.append(row_data)
                 
                 elif content_type == "messages":
-                    headers = ["Date", "Source", "Content", "User ID", "Username"]
+                    headers = ["Дата", "Источник", "Содержание", "ID пользователя", "Имя пользователя"]
                     sheet.append(headers)
                     
                     for message in content_data:
@@ -325,7 +405,7 @@ def create_excel_file(data_type, data, filename):
                         ]
                         sheet.append(row_data)
     
-    # Adjust column widths
+    # Настройка ширины столбцов
     for sheet in workbook.worksheets:
         for col in sheet.columns:
             max_length = 0
@@ -343,96 +423,116 @@ def create_excel_file(data_type, data, filename):
     workbook.save(filename)
     return filename
 
-# Functions to create JSON files
+# Функции для создания JSON файлов
 def create_json_file(data, filename):
     with open(filename, 'w', encoding='utf-8') as f:
         json.dump(data, f, ensure_ascii=False, indent=2)
     return filename
 
-# Message handlers for main buttons
-@dp.message(lambda message: message.text == "Export Posts")
+# Обработчики сообщений для основных кнопок
+@dp.message(lambda message: message.text == "Экспорт постов")
 async def export_posts_menu(message: types.Message):
     keyboard = InlineKeyboardMarkup(inline_keyboard=[
         [
-            InlineKeyboardButton(text="Last Week", callback_data="posts_week"),
-            InlineKeyboardButton(text="Last Two Weeks", callback_data="posts_two_weeks")
+            InlineKeyboardButton(text="Последняя неделя", callback_data="posts_week"),
+            InlineKeyboardButton(text="Последние две недели", callback_data="posts_two_weeks")
         ],
         [
-            InlineKeyboardButton(text="Last Month", callback_data="posts_month"),
-            InlineKeyboardButton(text="Custom Period", callback_data="posts_custom")
-        ],
-        [
-            InlineKeyboardButton(text="Excel Format", callback_data="posts_format_xlsx"),
-            InlineKeyboardButton(text="JSON Format", callback_data="posts_format_json")
+            InlineKeyboardButton(text="Последний месяц", callback_data="posts_month"),
+            InlineKeyboardButton(text="Другой период", callback_data="posts_custom")
         ]
     ])
-    await message.answer("Choose export period and format for Posts:", reply_markup=keyboard)
+    await message.answer("Выберите период для экспорта постов:", reply_markup=keyboard)
 
-@dp.message(lambda message: message.text == "Export Comments")
+@dp.message(lambda message: message.text == "Экспорт комментариев")
 async def export_comments_menu(message: types.Message):
     keyboard = InlineKeyboardMarkup(inline_keyboard=[
         [
-            InlineKeyboardButton(text="Last Week", callback_data="comments_week"),
-            InlineKeyboardButton(text="Last Two Weeks", callback_data="comments_two_weeks")
+            InlineKeyboardButton(text="Последняя неделя", callback_data="comments_week"),
+            InlineKeyboardButton(text="Последние две недели", callback_data="comments_two_weeks")
         ],
         [
-            InlineKeyboardButton(text="Last Month", callback_data="comments_month"),
-            InlineKeyboardButton(text="Custom Period", callback_data="comments_custom")
-        ],
-        [
-            InlineKeyboardButton(text="Excel Format", callback_data="comments_format_xlsx"),
-            InlineKeyboardButton(text="JSON Format", callback_data="comments_format_json")
+            InlineKeyboardButton(text="Последний месяц", callback_data="comments_month"),
+            InlineKeyboardButton(text="Другой период", callback_data="comments_custom")
         ]
     ])
-    await message.answer("Choose export period and format for Comments:", reply_markup=keyboard)
+    await message.answer("Выберите период для экспорта комментариев:", reply_markup=keyboard)
 
-@dp.message(lambda message: message.text == "Export Messages")
+@dp.message(lambda message: message.text == "Экспорт сообщений")
 async def export_messages_menu(message: types.Message):
     keyboard = InlineKeyboardMarkup(inline_keyboard=[
         [
-            InlineKeyboardButton(text="Last Week", callback_data="messages_week"),
-            InlineKeyboardButton(text="Last Two Weeks", callback_data="messages_two_weeks")
+            InlineKeyboardButton(text="Последняя неделя", callback_data="messages_week"),
+            InlineKeyboardButton(text="Последние две недели", callback_data="messages_two_weeks")
         ],
         [
-            InlineKeyboardButton(text="Last Month", callback_data="messages_month"),
-            InlineKeyboardButton(text="Custom Period", callback_data="messages_custom")
-        ],
-        [
-            InlineKeyboardButton(text="Excel Format", callback_data="messages_format_xlsx"),
-            InlineKeyboardButton(text="JSON Format", callback_data="messages_format_json")
+            InlineKeyboardButton(text="Последний месяц", callback_data="messages_month"),
+            InlineKeyboardButton(text="Другой период", callback_data="messages_custom")
         ]
     ])
-    await message.answer("Choose export period and format for Messages:", reply_markup=keyboard)
+    await message.answer("Выберите период для экспорта сообщений:", reply_markup=keyboard)
 
-@dp.message(lambda message: message.text == "Export All Content")
+@dp.message(lambda message: message.text == "Экспорт всего контента")
 async def export_all_menu(message: types.Message):
     keyboard = InlineKeyboardMarkup(inline_keyboard=[
         [
-            InlineKeyboardButton(text="Last Week", callback_data="all_week"),
-            InlineKeyboardButton(text="Last Two Weeks", callback_data="all_two_weeks")
+            InlineKeyboardButton(text="Последняя неделя", callback_data="all_week"),
+            InlineKeyboardButton(text="Последние две недели", callback_data="all_two_weeks")
         ],
         [
-            InlineKeyboardButton(text="Last Month", callback_data="all_month"),
-            InlineKeyboardButton(text="Custom Period", callback_data="all_custom")
-        ],
-        [
-            InlineKeyboardButton(text="Excel Format", callback_data="all_format_xlsx"),
-            InlineKeyboardButton(text="JSON Format", callback_data="all_format_json")
+            InlineKeyboardButton(text="Последний месяц", callback_data="all_month"),
+            InlineKeyboardButton(text="Другой период", callback_data="all_custom")
         ]
     ])
-    await message.answer("Choose export period and format for All Content:", reply_markup=keyboard)
+    await message.answer("Выберите период для экспорта всего контента:", reply_markup=keyboard)
 
-# Store user preferences
+@dp.message(lambda message: message.text == "Статистика")
+async def show_statistics(message: types.Message):
+    stats = get_statistics()
+    
+    response = "📊 **Статистика базы данных:**\n\n"
+    response += f"📝 Всего постов: {stats['total_posts']}\n"
+    response += f"💬 Всего комментариев: {stats['total_comments']}\n"
+    response += f"✉️ Всего сообщений: {stats['total_messages']}\n\n"
+    
+    response += "📈 **Топ-5 каналов:**\n"
+    for i, (channel, count) in enumerate(stats['top_channels'], 1):
+        response += f"{i}. {channel}: {count} постов\n"
+    
+    response += "\n📅 **Активность по дням недели:**\n"
+    for day, count in stats['activity_by_day']:
+        response += f"{day}: {count} записей\n"
+    
+    await message.answer(response, parse_mode="Markdown")
+
+@dp.message(lambda message: message.text == "Помощь")
+async def help_command(message: types.Message):
+    help_text = (
+        "🤖 **Справка по боту**\n\n"
+        "Этот бот собирает и экспортирует контент из Telegram-каналов и групп.\n\n"
+        "**Основные команды:**\n"
+        "• /start - Запустить бота\n\n"
+        "**Доступные функции:**\n"
+        "• **Экспорт постов** - Экспорт сообщений из каналов\n"
+        "• **Экспорт комментариев** - Экспорт комментариев к постам\n"
+        "• **Экспорт сообщений** - Экспорт сообщений из групповых чатов\n"
+        "• **Экспорт всего контента** - Экспорт всех данных сразу\n"
+        "• **Статистика** - Показать аналитику собранных данных\n\n"
+        "Для экспорта выберите тип данных, период и формат выгрузки (Excel или JSON)."
+    )
+    await message.answer(help_text, parse_mode="Markdown")
+
+# Хранение пользовательских предпочтений
 user_preferences = {}
 
-# Callback query handlers for period selection
+# Обработчики запросов обратного вызова для выбора периода
 @dp.callback_query(lambda query: query.data.split('_')[1] in ["week", "two_weeks", "month"])
 async def handle_period_selection(query: types.CallbackQuery):
     parts = query.data.split('_')
     data_type = parts[0]
     period = parts[1]
     
-    # Store the user's data type and period preference
+    # Сохранение предпочтений пользователя по типу данных и периоду
     user_id = query.from_user.id
     if user_id not in user_preferences:
         user_preferences[user_id] = {}
@@ -440,15 +540,30 @@ async def handle_period_selection(query: types.CallbackQuery):
     user_preferences[user_id]['data_type'] = data_type
     user_preferences[user_id]['period'] = period
     
-    await query.message.answer(f"Selected {period} period for {data_type}. Now choose the format.")
+    # Показываем кнопки выбора формата после выбора периода
+    keyboard = InlineKeyboardMarkup(inline_keyboard=[
+        [
+            InlineKeyboardButton(text="Excel формат", callback_data=f"{data_type}_format_xlsx"),
+            InlineKeyboardButton(text="JSON формат", callback_data=f"{data_type}_format_json")
+        ]
+    ])
+    
+    # Отображение выбранного периода на русском
+    period_text = {
+        "week": "последняя неделя", 
+        "two_weeks": "последние две недели", 
+        "month": "последний месяц"
+    }.get(period, period)
+    
+    await query.message.answer(f"Выбран период: {period_text}. Теперь выберите формат экспорта:", reply_markup=keyboard)
     await query.answer()
 
-# Callback query handlers for custom period
+# Обработчики запросов обратного вызова для пользовательского периода
 @dp.callback_query(lambda query: query.data.endswith("_custom"))
 async def handle_custom_period(query: types.CallbackQuery):
     data_type = query.data.split('_')[0]
     
-    # Store the user's data type preference
+    # Сохранение предпочтений пользователя по типу данных
     user_id = query.from_user.id
     if user_id not in user_preferences:
         user_preferences[user_id] = {}
@@ -456,75 +571,85 @@ async def handle_custom_period(query: types.CallbackQuery):
     user_preferences[user_id]['data_type'] = data_type
     user_preferences[user_id]['waiting_for'] = 'start_date'
     
-    await query.message.answer("Enter start date in format YYYY-MM-DD:")
+    await query.message.answer("Введите начальную дату в формате ГГГГ-ММ-ДД:")
     await query.answer()
 
-# Handler for receiving custom start date
+# Обработчик для получения пользовательской начальной даты
 @dp.message(lambda message: message.from_user.id in user_preferences and user_preferences[message.from_user.id].get('waiting_for') == 'start_date')
 async def handle_custom_start_date(message: types.Message):
     user_id = message.from_user.id
     
     try:
-        # Validate date format
+        # Проверка формата даты
         start_date = f"{message.text} 00:00:00"
         datetime.strptime(start_date, '%Y-%m-%d %H:%M:%S')
         user_preferences[user_id]['start_date'] = start_date
         user_preferences[user_id]['waiting_for'] = 'end_date'
-        await message.answer("Enter end date in format YYYY-MM-DD:")
+        await message.answer("Введите конечную дату в формате ГГГГ-ММ-ДД:")
     except ValueError:
-        await message.answer("Invalid date format. Please enter date in format YYYY-MM-DD:")
+        await message.answer("Неверный формат даты. Пожалуйста, введите дату в формате ГГГГ-ММ-ДД:")
 
-# Handler for receiving custom end date
+# Обработчик для получения пользовательской конечной даты
 @dp.message(lambda message: message.from_user.id in user_preferences and user_preferences[message.from_user.id].get('waiting_for') == 'end_date')
 async def handle_custom_end_date(message: types.Message):
     user_id = message.from_user.id
     
     try:
-        # Validate date format
+        # Проверка формата даты
         end_date = f"{message.text} 23:59:59"
         datetime.strptime(end_date, '%Y-%m-%d %H:%M:%S')
         user_preferences[user_id]['end_date'] = end_date
-        user_preferences[user_id]['waiting_for'] = 'format'
         
+        # Показываем кнопки выбора формата после выбора периода
+        data_type = user_preferences[user_id]['data_type']
         keyboard = InlineKeyboardMarkup(inline_keyboard=[
             [
-                InlineKeyboardButton(text="Excel Format", callback_data=f"{user_preferences[user_id]['data_type']}_format_xlsx"),
-                InlineKeyboardButton(text="JSON Format", callback_data=f"{user_preferences[user_id]['data_type']}_format_json")
+                InlineKeyboardButton(text="Excel формат", callback_data=f"{data_type}_format_xlsx"),
+                InlineKeyboardButton(text="JSON формат", callback_data=f"{data_type}_format_json")
             ]
         ])
-        await message.answer("Now choose the export format:", reply_markup=keyboard)
+        
+        await message.answer("Теперь выберите формат экспорта:", reply_markup=keyboard)
     except ValueError:
-        await message.answer("Invalid date format. Please enter date in format YYYY-MM-DD:")
+        await message.answer("Неверный формат даты. Пожалуйста, введите дату в формате ГГГГ-ММ-ДД:")
 
-# Callback query handlers for format selection
+# Обработчики запросов обратного вызова для выбора формата
 @dp.callback_query(lambda query: query.data.split('_')[1] == "format")
 async def handle_format_selection(query: types.CallbackQuery):
     parts = query.data.split('_')
     data_type = parts[0]
-    export_format = parts[2]  # xlsx or json
+    export_format = parts[2]  # xlsx или json
     
     user_id = query.from_user.id
     if user_id not in user_preferences:
-        await query.message.answer("Please select data type and period first.")
+        await query.message.answer("Пожалуйста, сначала выберите тип данных и период.")
         await query.answer()
         return
     
     user_prefs = user_preferences[user_id]
     user_prefs['format'] = export_format
     
-    # Process export based on saved preferences
+    # Обработка экспорта на основе сохраненных предпочтений
     try:
-        # Get date range either from custom dates or predefined period
+        # Получение диапазона дат из пользовательских дат или предопределенного периода
         if 'start_date' in user_prefs and 'end_date' in user_prefs:
             start_date = user_prefs['start_date']
             end_date = user_prefs['end_date']
         else:
             start_date, end_date = get_date_range(user_prefs.get('period', 'week'))
         
-        # Get data from database
+        # Получение данных из базы данных
         data = get_data_by_period(user_prefs['data_type'], start_date, end_date)
         
-        # Create export file
+        # Переводим названия типов для отображения
+        data_type_names = {
+            "posts": "посты",
+            "comments": "комментарии",
+            "messages": "сообщения",
+            "all": "весь контент"
+        }
+        
+        # Создание экспортного файла
         if export_format == 'xlsx':
             filename = f"{user_prefs['data_type']}_{datetime.now().strftime('%Y%m%d_%H%M%S')}.xlsx"
             export_file = create_excel_file(user_prefs['data_type'], data, filename)
@@ -532,41 +657,28 @@ async def handle_format_selection(query: types.CallbackQuery):
             filename = f"{user_prefs['data_type']}_{datetime.now().strftime('%Y%m%d_%H%M%S')}.json"
             export_file = create_json_file(data, filename)
         
-        # Send the file
+        # Отправка файла
         input_file = FSInputFile(export_file)
         period_str = user_prefs.get('period', 'custom period')
         if period_str == 'custom period':
-            period_str = f"{user_prefs.get('start_date', '').split()[0]} to {user_prefs.get('end_date', '').split()[0]}"
+            period_str = f"с {user_prefs.get('start_date', '').split()[0]} по {user_prefs.get('end_date', '').split()[0]}"
+        else:
+            period_translations = {
+                "week": "последняя неделя",
+                "two_weeks": "последние две недели",
+                "month": "последний месяц"
+            }
+            period_str = period_translations.get(period_str, period_str)
+        
+        data_type_name = data_type_names.get(user_prefs['data_type'], user_prefs['data_type'])
         
         await query.message.answer_document(
             input_file, 
-            caption=f"{user_prefs['data_type'].capitalize()} export for {period_str} in {export_format.upper()} format"
+            caption=f"Экспорт: {data_type_name}, период: {period_str}, формат: {export_format.upper()}"
         )
         
-        # Clean up the file
+        # Очистка файла
         os.remove(export_file)
         
     except Exception as e:
-        await query.message.answer(f"Error creating export: {str(e)}")
-    
-    # Clear user preferences
-    if user_id in user_preferences:
-        del user_preferences[user_id]
-    
-    await query.answer()
-
-# Main function to run both bot and client
-async def main():
-    initialize_database()
-    bot_task = asyncio.create_task(dp.start_polling(bot))
-    
-    # Start the Telethon client
-    phone_number = input("Enter your phone number (format: +79998887766): ")
-    await client.start(phone_number)
-    print("Bot is running and monitoring channels...")
-    
-    client_task = asyncio.create_task(client.run_until_disconnected())
-    await asyncio.gather(bot_task, client_task)
-
-if __name__ == '__main__':
-    asyncio.run(main())
+        await query.message.answer(f"
